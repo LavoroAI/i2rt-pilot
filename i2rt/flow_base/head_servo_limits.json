@@ -1,0 +1,10 @@
+{
+  "id": 1,
+  "zero": 1685,
+  "max": 2411,
+  "wrapped": false,
+  "recorded": "2026-03-09 08:56:40",
+  "offset": -1847,
+  "centered": "2026-03-09 09:01:15",
+  "swapped": "zero/max swapped: tilt was backwards"
+}
