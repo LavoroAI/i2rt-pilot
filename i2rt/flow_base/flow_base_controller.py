@@ -120,6 +120,12 @@ N_r1_r2_w = N_r1 * N_r2 * N_w
 N_s_r2_w = N_s * N_r2 * N_w
 TWO_PI = 2 * math.pi
 
+# Caster flip guard: slow the whole base so no steer motor exceeds this rate, and nudge near-reversed casters.
+FLIP_GUARD_MAX_STEER_VEL = 3.0  # rad/s
+FLIP_GUARD_MIN_SPEED = 0.02  # m/s at the steer axis
+FLIP_GUARD_NUDGE_DEG = 150.0
+FLIP_GUARD_NUDGE = 1.0  # rad/s
+
 
 STEER_MOTOR_IDS: Tuple[int, ...] = (1, 3, 5, 7)
 """The caster steering motors, in CAN-id order. The even ids are the drive motors, and the linear rail,
@@ -315,9 +321,11 @@ class Vehicle(Robot):
         verify_motor_config: bool = True,
         check_caster_steering: bool = True,
         state_callback: Optional[Callable[[], None]] = None,
+        flip_guard: bool = True,
     ):
         """
         Args:
+            flip_guard: Enable the caster flip guard (see FLIP_GUARD_*).
             state_callback: Called with no arguments once per control cycle, after that cycle's command is
                 sent, e.g. to record state at the control rate (like MotorChainRobot's joint_state_saver).
                 Runs on the control thread (SCHED_FIFO, max priority), so keep it well under 1 / control_freq
@@ -340,6 +348,9 @@ class Vehicle(Robot):
             raise ValueError(f"max_vel and max_accel must be positive on every axis, got {max_vel} and {max_accel}")
         self.control_freq = control_freq
         self.control_period = 1.0 / control_freq
+        self.flip_guard = flip_guard
+        self._flip_nudge = np.zeros(NUM_CASTERS)
+        logger.info(f"Caster flip guard: {'ON' if flip_guard else 'off'}")
         # Only a chain we opened ourselves is ours to shut down in close(); a caller who handed us a
         # live DMChainCanInterface still owns it and may keep using it afterwards. LinearRailVehicle
         # builds its own chain and passes the object down, so it re-asserts this after super().__init__.
@@ -633,7 +644,19 @@ class Vehicle(Robot):
                 dx_d_local = R @ dx_d
 
                 # Joint velocities
-                dq_d = self.C @ (AXIS_SIGN * dx_d_local)
+                twist_cmd = AXIS_SIGN * dx_d_local
+                dq_d = self.C @ twist_cmd
+
+                if self.flip_guard:
+                    k = self._flip_guard_scale(twist_cmd, dq_d)
+                    if k < 1.0:
+                        dq_d = k * dq_d
+                        twist_cmd = k * twist_cmd
+                        # Feed the slowed speed back so the base ramps up under max_accel, not jumps.
+                        self.otg_inp.current_velocity = k * np.asarray(self.otg_out.new_velocity)
+                        self.otg_inp.current_acceleration = np.zeros(self.num_dofs)
+                        self.otg_res = Result.Working
+                    dq_d[::2] += self._flip_nudge
 
                 vel_dict = {
                     "steer_vel": np.asarray(dq_d[::2], order="C"),
@@ -645,7 +668,7 @@ class Vehicle(Robot):
                 # state, the commanded twist and the joint commands derived from it are all from the
                 # same instant. Running it on another thread would sample them at different ones.
                 if self._caster_monitor is not None and self._caster_fault is None:
-                    fault = self._caster_monitor.update(AXIS_SIGN * dx_d_local, self.q[::2], dq_d[::2], self.dq[::2])
+                    fault = self._caster_monitor.update(twist_cmd, self.q[::2], dq_d[::2], self.dq[::2])
                     if fault is not None:
                         self._caster_fault = fault
                         self._stop_deadline = time.monotonic() + self._stop_budget
@@ -653,6 +676,24 @@ class Vehicle(Robot):
 
             # Last, so a slow callback delays the next cycle's read, not this cycle's command.
             self._notify_state()
+
+    def _flip_guard_scale(self, twist_local: np.ndarray, dq_d: np.ndarray) -> float:
+        """Return one scale in (0, 1] for all 8 motors and set the steer nudge for near-reversed casters."""
+        vx, vy, w = float(twist_local[0]), float(twist_local[1]), float(twist_local[2])
+        q_steer = self.q[::2]
+        self._flip_nudge = np.zeros(NUM_CASTERS)
+        for i in range(NUM_CASTERS):
+            ax, ay = vx - w * h_y[i], vy + w * h_x[i]
+            if math.hypot(ax, ay) < FLIP_GUARD_MIN_SPEED:
+                continue
+            d = math.atan2(ay, ax) - q_steer[i]
+            err = math.atan2(math.sin(d), math.cos(d))
+            if math.degrees(abs(err)) >= FLIP_GUARD_NUDGE_DEG:
+                self._flip_nudge[i] = FLIP_GUARD_NUDGE if err >= 0 else -FLIP_GUARD_NUDGE
+        steer_max = float(np.max(np.abs(dq_d[::2])))
+        if steer_max > FLIP_GUARD_MAX_STEER_VEL:
+            return FLIP_GUARD_MAX_STEER_VEL / steer_max
+        return 1.0
 
     def _notify_state(self) -> None:
         """Run the caller's state_callback, if any, without letting it end the control loop."""
@@ -906,6 +947,7 @@ class LinearRailVehicle(Vehicle):
         verify_motor_config: bool = True,
         check_caster_steering: bool = True,
         state_callback: Optional[Callable[[], None]] = None,
+        flip_guard: bool = True,
     ):
         """
         Initialize LinearRailVehicle with optional linear rail lift module.
@@ -1028,6 +1070,7 @@ class LinearRailVehicle(Vehicle):
                 # would only repeat it. This check runs at runtime, so it has to be passed down.
                 check_caster_steering=check_caster_steering,
                 state_callback=state_callback,
+                flip_guard=flip_guard,
             )
             # We built unified_motor_chain above, so we own it -- but Vehicle only saw a chain *object*
             # handed in, which it correctly reads as someone else's. Re-assert it, or close() leaves the
@@ -1204,6 +1247,8 @@ if __name__ == "__main__":
         """Serial device for the USB-GPIO converter; REQUIRED with --linear-rail on x86. Ignored on a Raspberry Pi (native GPIO)."""
         verify_motor_config: bool = True
         """Check every motor's type (gear ratio), control mode and PMAX/VMAX/TMAX before opening the chain. A wrong control mode is written and saved to Flash; a wrong gear ratio means the wrong part is fitted and always refuses; wrong scaling is only reported, and blocks the launch on a steering motor."""
+        flip_guard: bool = True
+        """Caster flip guard: limit steer rate on reversals by slowing the whole base (--no-flip-guard turns it off)."""
         check_caster_steering: bool = True
         """While moving, check the four steering motors are executing their commands. On a fault the base ramps to a stop and this exits 2. Cannot detect a wrong steering zero or STEERING_DIRECTION -- see the flow_base README."""
 
@@ -1216,17 +1261,14 @@ if __name__ == "__main__":
 
     CALIBRATION_RETRY_DELAY = 1
     DEADZONE = 0.05  # Deadzone for base control (x, y, theta)
-    RAIL_DEADZONE = 0.15  # Larger deadzone for linear rail to prevent unwanted movement
 
     # Initialize pygame and joystick only when gamepad teleop is enabled
-    joy = None
     if args.gamepad:
         pygame.init()
         pygame.joystick.init()
         if pygame.joystick.get_count() == 0:
             print("No joystick/gamepad connected!")
             exit()
-        joy = pygame.joystick.Joystick(0)
 
     max_vel = np.array([1.0, 1.0, np.pi])
     max_accel = np.array([0.8, 0.8, 3.0])
@@ -1246,6 +1288,7 @@ if __name__ == "__main__":
         usb_gpio_device=args.device,  # serial port for the USB-GPIO converter (x86)
         verify_motor_config=args.verify_motor_config,
         check_caster_steering=args.check_caster_steering,
+        flip_guard=args.flip_guard,
     )
 
     # Register cleanup function to ensure brake is engaged on exit
@@ -1256,6 +1299,15 @@ if __name__ == "__main__":
             logger.error(f"Error during atexit close: {e}")
 
     atexit.register(close_vehicle)
+
+    import signal
+
+    def _raise_interrupt(signum: int, frame: object) -> None:
+        raise KeyboardInterrupt
+
+    # Closing the terminal or kill runs the same cleanup as Ctrl-C.
+    signal.signal(signal.SIGTERM, _raise_interrupt)
+    signal.signal(signal.SIGHUP, _raise_interrupt)
 
     class TimeoutRemoteCommand:
         """Unified remote command handler for LinearRailVehicle (base + linear rail)"""
@@ -1311,24 +1363,11 @@ if __name__ == "__main__":
 
     gamepad = None
     if args.gamepad:
-        print(f"Joystick Name: {joy.get_name()}")
-        print(f"Number of Axes: {joy.get_numaxes()}")
-        print(f"Number of Buttons: {joy.get_numbuttons()}")
-
-        # Check all x, y, th are 0 at the beginning, if not ask user to check joystick
-        while True:
-            # Pump events to update joystick state
-            pygame.event.pump()
-            four_axis = [joy.get_axis(1), joy.get_axis(0), joy.get_axis(2), joy.get_axis(3)]
-            if all(np.abs(axis) < DEADZONE for axis in four_axis):
-                logger.info("Joystick is at rest, please check joystick")
-                break
-            else:
-                logger.warning(f"four_axis: {four_axis}")
-                logger.warning("Joystick's rest position is not at the center, please check joystick")
-                time.sleep(CALIBRATION_RETRY_DELAY)
-
         gamepad = Gamepad()
+        while not gamepad.centered(DEADZONE):
+            logger.warning("Joystick's rest position is not at the center, please check joystick")
+            time.sleep(CALIBRATION_RETRY_DELAY)
+        logger.info("Joystick is at rest")
     else:
         logger.info("Gamepad disabled; running with remote commands only.")
 
@@ -1357,13 +1396,7 @@ if __name__ == "__main__":
                 if gamepad_button["key_left_1"]:
                     vehicle.reset_odometry()
 
-                lift_vel = 0.0
-                if joy.get_numaxes() > 3:
-                    right_stick_y = joy.get_axis(3)  # Right stick Y-axis
-                    # Apply larger deadzone for linear rail to prevent unwanted movement
-                    # Invert: up (negative axis value) = positive velocity
-                    if np.abs(right_stick_y) > RAIL_DEADZONE:
-                        lift_vel = -right_stick_y  # Invert: up (negative axis) = positive velocity
+                lift_vel = gamepad.get_rail_cmd()  # D-pad up/down
 
                 cmd_4d = np.append(gamepad_cmd, lift_vel)
                 gamepad_override_button = gamepad_button["key_left_2"]
